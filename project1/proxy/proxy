@@ -1,0 +1,123 @@
+#!/usr/bin/env python
+import sys, thread, socket, time, re, select
+
+class Proxy:
+	def __init__(self, log_file, alpha, listen_port, fake_ip, server_ip):
+		self.cur_tp = 1000
+		self.log_file = log_file
+		self.alpha = alpha
+		self.listen_port = listen_port
+		self.fake_ip = fake_ip
+		self.server_ip = server_ip
+		self.bufsize = 4096
+
+	def run_proxy(self):
+		try:
+			#create an INET, STREAMing socket
+			browser_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+			# the SO_REUSEADDR flag tells the kernel to reuse a local socket in TIME_WAIT state, without waiting for its natural timeout to expire.
+			browser_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+			#bind the socket to a public host, and a well-known port
+			browser_socket.bind(('', self.listen_port))
+			#become a server socket
+			browser_socket.listen(5)
+		except:
+			print "Browser socket creation failed"
+		
+		while True:
+			# if there is one client
+			conn, addr = browser_socket.accept()
+			
+			# create a new thread for it
+			thread.start_new_thread(self.handle_requests, (browser_socket, conn, addr))
+		# destroy the browser socket
+		browser_socket.close()
+
+	def handle_requests(self, browser_socket, conn, addr):
+	
+		while True:
+			request_data = conn.recv(self.bufsize)
+			# start timing
+			ts = time.time()
+			# create server socket
+			server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+			server_socket.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+			server_socket.bind((self.fake_ip, 0))
+			server_socket.connect((self.server_ip, 8080))
+			# change file name
+			if 'big_buck_bunny' in request_data:
+				request_data = request_data.replace('big_buck_bunny', 'big_buck_bunny_nolist')
+			
+			# find chunk
+			pattern = re.compile('/vod/\d*Seg\d*-Frag\d*')
+			matched_string = re.search(pattern, request_data)
+			request_bitrate = avail_bitrates[0]
+			chunk_name = None
+
+			# find request bitrate
+			if matched_string:
+				matched_string = matched_string.group(0)
+				chunk_name = matched_string
+				request_bitrate = matched_string[matched_string.find('/',1)+1:matched_string.find('Seg')]
+				# adjust bitrate
+				for i in range(4):
+					if avail_bitrates[i] < self.cur_tp/1.5:
+						max_bitrate = avail_bitrates[i]
+				# change request
+				request_data = request_data.replace("/vod/" + str(request_bitrate) + "Seg", "/vod/" + str(max_bitrate) + "Seg")
+			# send request
+			server_socket.send(request_data)
+
+			# first chunk with header
+			received_data = server_socket.recv(self.bufsize)
+
+			# get content-length
+			content_length = int(received_data.split('Content-Length: ')[1].split('\r\n')[0])
+
+			# get header 
+			header = received_data.split('\r\n\r\n')[0]
+			content_length += len(header) + 4
+			remain_data_len = content_length-len(received_data)
+			content_length *= 8
+			# send back the header chunk
+			conn.send(received_data)
+			# process the remaining chunks
+			while remain_data_len > 0:
+				received_data = server_socket.recv(self.bufsize)
+
+				if received_data:
+					# track remain chunk
+					remain_data_len = remain_data_len - len(received_data)
+					tf = time.time()
+					if remain_data_len < self.bufsize:
+						interval = tf - ts
+						# new throughput
+						new_tp = content_length / interval / 1000
+						# EMWA throughput
+						self.cur_tp = self.alpha * new_tp + (1-self.alpha) * self.cur_tp
+					#send back the received data
+					conn.send(received_data)
+				else:
+					break
+
+			if chunk_name is not None:
+				log = str(time.time()) + ' ' + str(interval) + ' ' + \
+				str(new_tp) + ' ' + str(self.cur_tp) + ' ' + str(max_bitrate) + ' ' + \
+				str(server_ip) + ' ' + chunk_name + '\n'
+				# print log
+				with open(self.log_file, "a") as file:
+					file.write(log)
+			server_socket.close()
+		conn.close()
+
+if __name__ == "__main__":
+	avail_bitrates = [10, 100, 500, 1000]
+
+	log_file = sys.argv[1]
+	alpha = float(sys.argv[2])
+	listen_port = int(sys.argv[3])
+	fake_ip = sys.argv[4]
+	server_ip = sys.argv[5]
+
+	proxy = Proxy(log_file, alpha, listen_port, fake_ip, server_ip)
+	proxy.run_proxy()
