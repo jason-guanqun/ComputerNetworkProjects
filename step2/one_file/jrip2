@@ -1,0 +1,139 @@
+#!/usr/bin/python
+import socket
+import argparse
+import random
+import time
+import datetime
+import os
+import json
+import thread
+import threading
+from sets import Set
+
+# Command line parameters
+parser = argparse.ArgumentParser(description='GBN agent')
+parser.add_argument('-l', dest='loss_rate', action='store', default=0, type=float)
+parser.add_argument('-p', dest='rec_port_num', action='store', default=5001, type=int)
+args, unknownargs = parser.parse_known_args()
+
+# get arguments
+loss_rate = args.loss_rate
+rec_port_num = args.rec_port_num
+
+# extract IPs and Ports
+UDP_IPs = [each.split(':')[0] for each in unknownargs]
+UDP_PORTs = [each.split(':')[1] for each in unknownargs]
+costs = [each.split(':')[2] for each in unknownargs]
+
+
+receiver_sock = socket.socket(socket.AF_INET, # Internet
+               socket.SOCK_DGRAM) # UDP
+receiver_sock.bind(('', rec_port_num))
+
+message = { "Type" : "JRIP", "RIPTable": []}
+
+for UDP_IP, UDP_PORT, cost in zip(UDP_IPs, UDP_PORTs, costs):
+  message["RIPTable"].append({"Dest" : UDP_IP+":"+UDP_PORT, "Next" : UDP_IP+":"+UDP_PORT, "Cost" : cost})
+
+def make_pkt(num):
+	send_dict = {"SEQ" : num, "ACK" : 0, "Data": message}
+	send_packet=json.dumps(send_dict)
+	return send_packet
+########################     Multiple destinations    ##############################
+def sender(UDP_IP, UDP_PORT):
+	if os.path.exists(str(UDP_PORT) +".txt"):
+	    os.remove(str(UDP_PORT) +".txt")
+
+	each_addr = UDP_IP+':'+str(UDP_PORT)
+	all_nb_timers[each_addr] = time.time()
+
+	def rdt_send():
+		send_packet=make_pkt(all_nb_states[each_addr]['nextseqnum'])
+		receiver_sock.sendto(send_packet, (UDP_IP, UDP_PORT))
+		print "Send data", all_nb_states[each_addr]['nextseqnum']
+		all_nb_states[each_addr]['nextseqnum'] += 1
+
+	while True:
+		##################  Send packets  ##################
+		time.sleep(0.1)
+		if (all_nb_states[each_addr]['nextseqnum'] < all_nb_states[each_addr]['base'] + window_size):
+			if random.random() < loss_rate:
+				print "Packet ",all_nb_states[each_addr]['nextseqnum'], " Loss!"
+				all_nb_states[each_addr]['nextseqnum'] += 1
+			else:
+				rdt_send()
+			if all_nb_states[each_addr]['base']==all_nb_states[each_addr]['nextseqnum']:
+				all_nb_timers[each_addr] = time.time()
+
+		now_time = time.time()
+		if (now_time - all_nb_timers[each_addr] >= TIME_OUT):
+			for i in range(all_nb_states[each_addr]['base'], all_nb_states[each_addr]['nextseqnum']):
+				send_packet=make_pkt(i)
+				receiver_sock.sendto(send_packet, (UDP_IP, UDP_PORT))
+				print "Time Out! ", "Resend data: ", i
+
+def receiver():
+	 ##################  Receive a packet  ##################
+	while True:
+		# time.sleep(0.1)
+		received_data, received_addr = receiver_sock.recvfrom(1024)
+		each_addr = ':'.join([received_addr[0],str(received_addr[1])])
+		received_seq_num = json.loads(received_data)["SEQ"]
+		received_ack_num = json.loads(received_data)["ACK"]
+
+      ##################  if received ack packet  ################## 
+		if received_seq_num == -1:
+			print "Received ACK for: ", received_ack_num
+			# Receiver has received all 100 packets
+			# if received_ack_num == -1:
+			#     break
+			all_nb_states[each_addr]['base'] = received_ack_num + 1
+			if all_nb_states[each_addr]['base'] == all_nb_states[each_addr]['nextseqnum']:
+				all_nb_timers[each_addr] = time.time()
+
+      ##################  if received regular packet  ##################
+		else:
+		# if seccessfully receive expected sequence number
+			all_nb_states[each_addr]['count'] += 1
+			print all_nb_states[each_addr]['count']
+			if all_nb_states[each_addr]['count'] == 100:
+				with open(str(rec_port_num) +".txt",'a') as file:
+					file.write("Goodput Rate at " + str(received_addr[0]) + ':' + str(received_addr[1]) + ' ' + str(len(all_valid_packets[each_addr])) + '/' + str(all_nb_states[each_addr]['count']) + '\n')
+			    # file.write("Receiver loss rate is: " + str(float(len(valid_packets))/local.count))
+				print "Receiver loss rate is: ", float(len(all_valid_packets[each_addr]))/all_nb_states[each_addr]['count']
+			if received_seq_num == all_nb_states[each_addr]['expectedseqnum']:
+				print "Received expected package: ", received_seq_num, "Expected: ", all_nb_states[each_addr]['expectedseqnum']
+				all_valid_packets[each_addr].add(received_seq_num)
+				# Update ACK to sender
+				all_nb_states[each_addr]['expectedseqnum'] += 1
+				send_dict = {"uni" : "gw2353", "SEQ" : -1, "ACK" : received_seq_num, "Data" : {}}
+				send_ack_packet = json.dumps(send_dict)
+				receiver_sock.sendto(send_ack_packet, (received_addr[0], received_addr[1]))
+			# Resend previous ACK
+			else:
+				print "Received out of order", received_seq_num, "Expected: ", all_nb_states[each_addr]['expectedseqnum']
+				send_dict = {"uni" : "gw2353", "SEQ" : -1, "ACK" : all_nb_states[each_addr]['expectedseqnum']-1, "Data" : {}}
+				send_ack_packet = json.dumps(send_dict)
+				receiver_sock.sendto(send_ack_packet, (received_addr[0], received_addr[1]))
+
+	print "Transmission Complete!"
+	receiver_sock.close()
+
+if __name__ == "__main__":
+	time.sleep(4)
+
+	window_size = 5
+	TIME_OUT = 0.6 # Because time.sleep(0.1) at sender
+	all_valid_packets = {}
+	all_nb_states = {}
+	all_nb_timers = {}
+
+	for UDP_IP, UDP_PORT, cost in zip(UDP_IPs, UDP_PORTs, costs):
+		addr = UDP_IP+":"+UDP_PORT
+		all_nb_states[addr]={'base':1, 'nextseqnum':1, 'expectedseqnum':1, 'count':0}
+		all_valid_packets[addr]=Set()
+		thread.start_new_thread(sender, (UDP_IP, int(UDP_PORT)))
+
+	thread.start_new_thread(receiver, ())
+	while True:
+		pass

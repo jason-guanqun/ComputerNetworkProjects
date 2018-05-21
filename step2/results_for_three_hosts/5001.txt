@@ -1,0 +1,2 @@
+Goodput Rate at 127.0.0.1:5002 72/100
+Goodput Rate at 127.0.0.1:7999 69/100

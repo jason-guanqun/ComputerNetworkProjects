@@ -1,0 +1,221 @@
+#!/usr/bin/python
+import socket
+import json
+import argparse
+import time
+import threading
+
+UDP_IP = "127.0.0.1"
+# UDP_PORT = 5005
+parser = argparse.ArgumentParser(description='UDP receiver')
+parser.add_argument('-p', dest='rec_port_num', action='store', default=5001, type=int)
+args, unknownargs = parser.parse_known_args()
+
+UDP_PORT = args.rec_port_num
+
+# extract IPs and Ports
+UDP_IPs = [each.split(':')[0] for each in unknownargs]
+UDP_PORTs = [each.split(':')[1] for each in unknownargs]
+costs = [each.split(':')[2] for each in unknownargs]
+costs = [0] + costs
+
+my_addr = ":".join([UDP_IP,str(UDP_PORT)])
+all_addr = []
+all_addr.append(my_addr)
+
+
+for ip, port in zip(UDP_IPs, UDP_PORTs):
+	all_addr.append(":".join([ip, port]))
+
+######################## Record original distance ########################
+origin_dis = {}
+
+for each_addr, cost in zip(all_addr, costs):
+	origin_dis[each_addr] = int(cost)
+
+######################## Bind socket ########################
+
+sock = socket.socket(socket.AF_INET, # Internet
+                     socket.SOCK_DGRAM) # UDP
+sock.bind((UDP_IP, UDP_PORT))
+
+######################## Make Table ########################
+
+my_table = {}
+my_table[my_addr]={}
+
+for i in range(len(all_addr)):
+	my_table[all_addr[i]]={}
+	for j in range(len(all_addr)):
+		my_table[all_addr[i]][all_addr[j]]={}
+		if all_addr[i]==my_addr:
+			my_table[all_addr[i]][all_addr[j]]['cost']=int(costs[j])
+			my_table[all_addr[i]][all_addr[j]]['nexthop']=all_addr[j]
+
+		else:
+			my_table[all_addr[i]][all_addr[j]]['cost']=-1
+			my_table[all_addr[i]][all_addr[j]]['nexthop']='None'
+
+
+time.sleep(3)
+######################## Initial Send ########################
+
+send_table = json.dumps(my_table)
+for ip, port in zip(UDP_IPs, UDP_PORTs):
+	sock.sendto(send_table, (ip, int(port)))
+
+def daemon():
+	while True:
+		time.sleep(10)
+		send_table = json.dumps(my_table)
+		print "[IP/PORT DESTINATION] [DISTANCE] [NEXT_HOP]"
+		for dest in my_table[my_addr]:
+			init_cost = -1
+			init_nexthop = 'None'
+			for nb_ip in my_table: 
+				cur_cost = origin_dis[nb_ip] + my_table[nb_ip][dest]["cost"]
+				if init_cost == -1:
+					init_cost = cur_cost
+					init_nexthop = my_table[nb_ip][dest]["nexthop"]
+				if  cur_cost < init_cost:
+					init_cost = cur_cost
+					init_nexthop = my_table[nb_ip][dest]["nexthop"]
+
+			print str(dest)+ "		" + str(init_cost) + "	  " + str(init_nexthop)
+
+		for ip, port in zip(UDP_IPs, UDP_PORTs):
+			sock.sendto(send_table, (ip, int(port)))
+
+def trace_daemon(received_table, next_hop):
+	while True:
+		sock.sendto(json.dumps(received_table), (next_hop.split(':')[0], int(next_hop.split(':')[1])))
+		time.sleep(5)
+
+def proc_trace(received_table):
+	origin_ip = received_table["Origin"].split(':')[0]
+	origin_port = received_table["Origin"].split(':')[1]
+	dest = received_table["Destination"]
+	next_hop = my_table[my_addr][dest]['nexthop']
+
+	if dest != my_addr:
+		# print "Next hop is ", next_hop
+		received_table["TRACE"].append(my_addr)
+		t_trace = threading.Thread(target = trace_daemon, args = (received_table, next_hop))
+		t_trace.daemon = True
+		t_trace.start()
+	# if not received_table["TRACE"]:
+	# 	received_table["TRACE"].append(my_addr)
+	# 	t_trace = threading.Thread(target = trace_daemon, args = (next_hop))
+
+	# else if dest!=my_addr:
+	# 	received_table["TRACE"].append(my_addr)
+	# 	t_trace = threading.Thread(target = trace_daemon, args = (next_hop))
+	else:
+		received_table["TRACE"].append(my_addr)
+		sock.sendto(json.dumps(received_table), (origin_ip, int(origin_port)))
+	
+
+t = threading.Thread(target = daemon, args = ())
+t.daemon = True
+t.start()
+
+
+while True:
+	update = False
+	new_nbs = []
+
+	##################### received #####################
+	received_data, recv_addr = sock.recvfrom(2048)
+	received_table = json.loads(received_data)
+
+	if "Type" in received_table and received_table["Type"]=="TRACE":
+		proc_trace(received_table)
+		continue
+
+	received_addr = ":".join([recv_addr[0],str(recv_addr[1])])
+	
+	use_vector = received_table[received_addr]
+	my_table[received_addr] = use_vector
+	use_dis = origin_dis[received_addr]
+
+	for each_entry in use_vector:
+		if each_entry not in my_table[my_addr]:
+			my_table[my_addr][each_entry]={}
+			update = True
+			my_table[my_addr][each_entry]['cost'] = use_dis + use_vector[each_entry]['cost']
+			my_table[my_addr][each_entry]['nexthop'] = received_addr
+		else:
+			old_cost = my_table[my_addr][each_entry]['cost']
+			my_table[my_addr][each_entry]['cost'] = min(my_table[my_addr][each_entry]['cost'], use_dis + use_vector[each_entry]['cost'])
+			if my_table[my_addr][each_entry]['cost'] != old_cost:
+				my_table[my_addr][each_entry]['nexthop'] = received_addr
+				update = True
+
+	# for each_new_entry in received_table:
+	# 	if each_new_entry in my_table:
+
+	# 	else:
+	# 		my_table[each_new_entry] = received_table[each_new_entry]
+	# 		my_table[my_addr][each_new_entry] = my_table[my_addr][received_addr] + received_table[received_addr][each_new_entry]
+
+
+
+	# my_table[received_addr] = received_table[received_addr]
+
+
+	##################### protected for efficiency #####################
+	# for new_nb in received_table:
+	# 	if new_nb not in my_table:
+	# 		print new_nb
+	# 		new_nbs.append(new_nb)
+	# 		my_table[new_nb] = received_table[new_nb]
+
+	# for row in my_table:
+	# 	for column in my_table:
+	# 		if column not in my_table[row]:
+	# 			print column
+	# 			my_table[row][column]=-1
+
+	# if new_nbs:
+	# 	for each_addr in my_table:
+	# 		if each_addr not in new_nbs:
+	# 			for add_nb in new_nbs:
+	# 				my_table[each_addr][add_nb] = -1
+	##################### protected for efficiency #####################
+
+	# if received_addr not in my_table:
+	# 	my_table[received_addr] = received_table[received_addr]
+
+
+	# else:
+	# 	my_table[received_addr] = received_table[received_addr]
+	# if len(received_table[received_addr])<len(my_table[received_addr]):
+	# 	my_table[received_addr] = received_table[received_addr]
+	# my_vector = my_table[my_addr]
+	# print my_table
+
+	##################### update each entry for my vector #####################
+	# for each_addr in my_vector.keys():
+	# 	if each_addr == my_addr:
+	# 		continue
+	# 	old_cost = my_vector[each_addr]
+	# 	candidate = []
+	# 	##################### find all neighbour vector #####################
+	# 	for nb_ip in my_table.keys():
+	# 		if (nb_ip == my_addr) or (my_table[nb_ip][each_addr]==-1) or (nb_ip not in all_addr):
+	# 		# if nb_ip == my_addr:
+	# 			continue
+	# 		nb_vector = my_table[nb_ip]
+	# 		candidate.append(int(origin_dis[nb_ip]+nb_vector[each_addr]))
+	# 	##################### update entry #####################
+	# 	if candidate:
+	# 		new_cost = min(candidate)
+	# 		if new_cost != old_cost:
+	# 			my_table[my_addr][each_addr] = new_cost
+	# 			update = True
+	##################### check if update #####################
+	if update:
+		print "I just update my routing table!"
+		for ip, port in zip(UDP_IPs, UDP_PORTs):
+			sock.sendto(json.dumps(my_table), (ip, int(port)))
+		
